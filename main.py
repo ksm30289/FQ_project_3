@@ -69,7 +69,9 @@ BATCH_SIZE = _get_int_env("BATCH_SIZE", 100)
 MAX_REVIEWS = _get_int_env("MAX_REVIEWS", 1000)
 SLEEP_SECONDS = _get_float_env("SLEEP_SECONDS", 1.0)
 LOW_RATING_MAX_SCORE = _get_int_env("LOW_RATING_MAX_SCORE", 2)
-STOP_WHEN_OLDER_THAN_LAST_SYNC = _get_bool_env("STOP_WHEN_OLDER_THAN_LAST_SYNC", True)
+
+# ✅ 오래된 리뷰를 만나도 중단하지 않고 스킵만 하고 계속 진행
+STOP_WHEN_OLDER_THAN_LAST_SYNC = _get_bool_env("STOP_WHEN_OLDER_THAN_LAST_SYNC", False)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -163,7 +165,15 @@ class GoogleSheetClient:
     def _ensure_header(self, ws, headers: List[str]) -> None:
         first_row = ws.row_values(1)
         if first_row != headers:
-            ws.update(f"A1:{chr(64 + len(headers))}1", [headers])
+            end_col = self._column_letter(len(headers))
+            ws.update(f"A1:{end_col}1", [headers])
+
+    def _column_letter(self, n: int) -> str:
+        result = ""
+        while n > 0:
+            n, rem = divmod(n - 1, 26)
+            result = chr(65 + rem) + result
+        return result
 
     def get_existing_review_ids(self, ws) -> Set[str]:
         values = ws.col_values(1)
@@ -237,13 +247,11 @@ def classify_sentiment(score: int, content: str) -> str:
     pos_hits = sum(1 for kw in POSITIVE_KEYWORDS if kw.lower() in text)
     neg_hits = sum(1 for kw in NEGATIVE_KEYWORDS if kw.lower() in text)
 
-    # 별점 우선
     if score >= 4 and neg_hits == 0:
         return "positive"
     if score <= 2:
         return "negative"
 
-    # 텍스트 보정
     if pos_hits > neg_hits and pos_hits >= 1:
         return "positive"
     if neg_hits > pos_hits and neg_hits >= 1:
@@ -256,6 +264,7 @@ def map_review_to_row(review: Dict[str, Any], sentiment: str) -> List[Any]:
     created_at_utc, created_at_local = normalize_datetime(review.get("at"))
     collected_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+    # ✅ 개발자 답변(replyContent, repliedAt)은 저장하지 않음
     return [
         str(review.get("reviewId", "")).strip(),
         str(review.get("userName", "")).strip(),
@@ -289,7 +298,6 @@ def fetch_reviews_incremental(
     all_reviews: List[Dict[str, Any]] = []
     continuation_token = None
     page = 0
-    reached_old_reviews = False
 
     while len(all_reviews) < max_reviews:
         remaining = max_reviews - len(all_reviews)
@@ -311,30 +319,34 @@ def fetch_reviews_incremental(
             print("[INFO] 더 이상 가져올 리뷰가 없습니다.")
             break
 
+        old_review_found_in_page = False
+
         for item in result:
             review_dt = item.get("at")
             if review_dt and review_dt.tzinfo is None:
                 review_dt = review_dt.replace(tzinfo=timezone.utc)
 
-            if last_synced_at and review_dt:
-                if review_dt <= last_synced_at:
-                    reached_old_reviews = True
-                    if STOP_WHEN_OLDER_THAN_LAST_SYNC:
-                        print("[INFO] 마지막 동기화 시점보다 오래된 리뷰를 만나 수집 중단.")
-                        break
-                    continue
+            if last_synced_at and review_dt and review_dt <= last_synced_at:
+                old_review_found_in_page = True
+
+                if STOP_WHEN_OLDER_THAN_LAST_SYNC:
+                    print("[INFO] 마지막 동기화 시점보다 오래된 리뷰를 만나 수집 중단.")
+                    return all_reviews
+
+                # ✅ 오래된 리뷰는 스킵만 하고 계속 진행
+                continue
 
             all_reviews.append(item)
 
             if len(all_reviews) >= max_reviews:
                 break
 
-        if reached_old_reviews and STOP_WHEN_OLDER_THAN_LAST_SYNC:
-            break
-
         if continuation_token is None:
             print("[INFO] continuation_token 없음. 마지막 페이지 도달.")
             break
+
+        if old_review_found_in_page and not STOP_WHEN_OLDER_THAN_LAST_SYNC:
+            print("[INFO] 오래된 리뷰가 포함되어 있었지만 스킵 후 계속 진행합니다.")
 
         time.sleep(SLEEP_SECONDS)
 
@@ -346,6 +358,7 @@ def main():
     print(f"[INFO] APP_ID={APP_ID}")
     print(f"[INFO] LANG={LANG}, COUNTRY={COUNTRY}, SORT={SORT_NAME}")
     print(f"[INFO] BATCH_SIZE={BATCH_SIZE}, MAX_REVIEWS={MAX_REVIEWS}")
+    print(f"[INFO] STOP_WHEN_OLDER_THAN_LAST_SYNC={STOP_WHEN_OLDER_THAN_LAST_SYNC}")
 
     sort_mode = SORT_MAP.get(SORT_NAME)
     if sort_mode is None:
